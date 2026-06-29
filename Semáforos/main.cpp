@@ -25,6 +25,11 @@ std::condition_variable condFilaRecebidos;
 std::mutex mutexFilaEnvio;
 std::condition_variable condFilaEnvio;
 
+// --- CONTROLE DA THREAD DE TECLADO ---
+std::mutex mutexTeclado;
+std::condition_variable condTeclado;
+bool aguardandoReset = false;
+
 bool sistemaRodando = true;
 
 // --- SOCKET GLOBAL PARA AS THREADS COMPARTILHAREM A CONEXÃO ---
@@ -205,7 +210,7 @@ void threadEnvia() {
 
         // --- ENVIO REAL AQUI ---
         // Bloqueia o uso do socket para garantir estabilidade
-        std::lock_guard<std::mutex> lock(mutexSocket);
+std::lock_guard<std::mutex> lock(mutexSocket);
         
         if (socketClienteAtivo != INVALID_SOCKET) {
             int resultadoEnvio = send(socketClienteAtivo, jsonParaEnviar.c_str(), jsonParaEnviar.length(), 0);
@@ -214,9 +219,53 @@ void threadEnvia() {
                 std::cerr << "[THREAD ENVIA][ERR] Erro ao enviar dados para a ESP32.\n";
             } else {
                 std::cout << "[THREAD ENVIA] Enviado com sucesso via rede: " << jsonParaEnviar;
+                
+                // VERIFICAÇÃO: Se o JSON continha a ordem CRITICO, acorda o terminal
+                if (jsonParaEnviar.find("CRITICO") != std::string::npos) {
+                    {
+                        std::lock_guard<std::mutex> lockTeclado(mutexTeclado);
+                        aguardandoReset = true;
+                    }
+                    condTeclado.notify_one(); // Libera a thread do teclado
+                }
             }
         } else {
-            std::cout << "[THREAD ENVIA][AVISO] Mensagem ignorada: Nenhuma ESP32 conectada no momento.\n";
+            std::cout << "[THREAD ENVIA][AVISO] Mensagem ignorada: Nenhuma ESP32 conectada.\n";
+        }
+    }
+}
+
+void threadMonitorTeclado() {
+    std::string entradaUsuario;
+    const std::string CHAVE_ESPERADA = "RESET";
+
+    while (sistemaRodando) {
+        // 1. Fica completamente adormecida até o send() do CRITICO acontecer
+        {
+            std::unique_lock<std::mutex> lock(mutexTeclado);
+            condTeclado.wait(lock, [] { return aguardandoReset || !sistemaRodando; });
+        }
+
+        if (!sistemaRodando) break;
+
+        // 2. Acordou. O pacote já foi enviado. Agora trava no getline aguardando o usuário
+        std::cout << "\n[TERMINAL] Pacote CRITICO confirmado na rede. Digite 'RESET' e pressione ENTER: ";
+        std::getline(std::cin, entradaUsuario);
+
+        // 3. Valida a entrada
+        if (entradaUsuario == CHAVE_ESPERADA) {
+            std::cout << "[TECLADO] Comando aceito. Gerando ordem de RESET...\n";
+            
+            // Coloca a nova ordem na FIFO de envio
+            ordem(0, 1); 
+            
+            // Reseta a flag e volta a dormir no próximo ciclo do while
+            {
+                std::lock_guard<std::mutex> lock(mutexTeclado);
+                aguardandoReset = false;
+            }
+        } else if (!entradaUsuario.empty()) {
+            std::cout << "[TECLADO] Comando ignorado: " << entradaUsuario << std::endl;
         }
     }
 }
@@ -230,12 +279,13 @@ int main() {
     std::thread tEscuta(threadEscuta);
     std::thread tProcessa(threadProcessa);
     std::thread tEnvia(threadEnvia);
-
+    std::thread tTeclado(threadMonitorTeclado);
     std::cout << "Todas as threads rodando em paralelo. Pressione Ctrl+C para encerrar.\n" << std::endl;
 
     tEscuta.join();
     tProcessa.join();
     tEnvia.join();
+    tTeclado.join();
 
     return 0;
 }
