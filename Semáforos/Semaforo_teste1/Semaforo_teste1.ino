@@ -92,6 +92,11 @@ void taskEscutaRede(void* pvParameters);
 void CRITICO() {
     estadoAtual = MODO_CRITICO;
     Serial.println("[ESTADO] Transicao para MODO_CRITICO efetuada.");
+    
+    // Interrompe qualquer delay da taskRotina imediatamente
+    if (TaskRotinaHandle != NULL) {
+        xTaskNotifyGive(TaskRotinaHandle);
+    }
 }
 
 void RESET() {
@@ -182,7 +187,7 @@ void taskRotina(void* pvParameters) {
             xSemaphoreGive(xSinalFase);
             xSemaphoreGive(xMutexRotina);
         }
-        vTaskDelay(TEMPO_VERMELHO);
+        if (ulTaskNotifyTake(pdTRUE, TEMPO_VERMELHO) > 0) continue;
 
         // --- FASE: VERDE ---
         if (estadoAtual == MODO_ROTINA &&
@@ -191,7 +196,7 @@ void taskRotina(void* pvParameters) {
             atualizarFarol(1, 0, 0);
             xSemaphoreGive(xSinalFase);
             xSemaphoreGive(xMutexRotina);
-            vTaskDelay(TEMPO_VERDE);
+            if (ulTaskNotifyTake(pdTRUE, TEMPO_VERDE) > 0) continue;
         }
 
         // --- FASE: AMARELO ---
@@ -201,7 +206,7 @@ void taskRotina(void* pvParameters) {
             atualizarFarol(0, 1, 0);
             xSemaphoreGive(xSinalFase);
             xSemaphoreGive(xMutexRotina);
-            vTaskDelay(TEMPO_AMARELO);
+            if (ulTaskNotifyTake(pdTRUE, TEMPO_AMARELO) > 0) continue;
         }
 
         vTaskDelay(pdMS_TO_TICKS(1));
@@ -241,6 +246,11 @@ void taskEscutaRede(void* pvParameters) {
         // 1. Gerenciamento da Conexão
         if (!tcpClient.connected()) {
             Serial.println("[REDE] EscutaRede: reconectando ao servidor Master...");
+            // --- GATILHO FAILSAFE ---
+            // if (estadoAtual != MODO_CRITICO) {
+            //     Serial.println("[FAILSAFE] TCP Desconectado. Forcando MODO_CRITICO imediato.");
+            //     CRITICO();
+            // }
             tcpClient.stop();
 
             if (!tcpClient.connect(serverIP, serverPort)) {
