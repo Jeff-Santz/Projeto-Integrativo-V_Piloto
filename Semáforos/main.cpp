@@ -1,6 +1,8 @@
 #include <iostream>
 #include <thread>
 #include <queue>
+#include <vector>
+#include <algorithm>
 #include <mutex>
 #include <condition_variable>
 #include <string>
@@ -32,16 +34,30 @@ bool aguardandoReset = false;
 
 bool sistemaRodando = true;
 
-// --- SOCKET GLOBAL PARA AS THREADS COMPARTILHAREM A CONEXÃO ---
-SOCKET socketClienteAtivo = INVALID_SOCKET;
-std::mutex mutexSocket; // Garante que não haverá conflito ao fechar/usar o socket
+// --- VETOR DE SOCKETS PARA SUPORTAR MÚLTIPLAS ESP32 (BROADCAST) ---
+std::vector<SOCKET> clientesAtivos;
+std::mutex mutexSocket; // Protege o vetor de clientesAtivos
 
 // Declaração prévia das funções
 void ordem(int critico, int reset);
 void lerMensagem(std::string jsonRecebido);
+void threadClienteHandler(SOCKET clientSocket, std::string clientIp);
 
 // =================================================================
-// 1. THREAD: ESCUTA MENSAGENS (RECEBE REAL)
+// FUNÇÃO AUXILIAR: REMOVE UM SOCKET DO VETOR DE CLIENTES ATIVOS
+// =================================================================
+void removerCliente(SOCKET s) {
+    std::lock_guard<std::mutex> lock(mutexSocket);
+    clientesAtivos.erase(
+        std::remove(clientesAtivos.begin(), clientesAtivos.end(), s),
+        clientesAtivos.end()
+    );
+    closesocket(s);
+}
+
+// =================================================================
+// 1. THREAD: ESCUTA CONEXÕES (ACCEPT) E DELEGA CADA CLIENTE
+//    PARA UMA THREAD DEDICADA
 // =================================================================
 void threadEscuta() {
     std::cout << "[THREAD ESCUTA] Inicializando Winsock..." << std::endl;
@@ -50,7 +66,6 @@ void threadEscuta() {
     SOCKET serverSocket;
     struct sockaddr_in serverAddr, clientAddr;
     int clientAddrSize = sizeof(clientAddr);
-    char buffer[BUFFER_SIZE];
 
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         std::cerr << "[THREAD ESCUTA][ERR] Falha ao inicializar Winsock.\n";
@@ -74,51 +89,81 @@ void threadEscuta() {
     listen(serverSocket, SOMAXCONN);
     std::cout << "[THREAD ESCUTA] Servidor pronto e escutando na porta " << PORT << "...\n";
 
+    // Loop principal de accept(): cada nova conexão vira uma thread dedicada,
+    // permitindo múltiplas ESP32 conectadas simultaneamente.
     while (sistemaRodando) {
-        SOCKET tempSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &clientAddrSize);
-        if (tempSocket == INVALID_SOCKET) continue;
+        SOCKET novoSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &clientAddrSize);
+        if (novoSocket == INVALID_SOCKET) {
+            if (!sistemaRodando) break;
+            continue;
+        }
 
         char clientIp[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &clientAddr.sin_addr, clientIp, INET_ADDRSTRLEN);
-        std::cout << "\n[THREAD ESCUTA] Cliente conectado de: " << clientIp << "\n";
+        std::string ipStr(clientIp);
+        std::cout << "\n[THREAD ESCUTA] Cliente conectado de: " << ipStr << "\n";
 
-        // Salva o socket globalmente para a outra thread poder usar para enviar
+        // Adiciona o novo cliente ao vetor compartilhado
         {
             std::lock_guard<std::mutex> lock(mutexSocket);
-            socketClienteAtivo = tempSocket;
+            clientesAtivos.push_back(novoSocket);
         }
 
-        // Loop de recebimento de dados deste cliente
-        while (sistemaRodando) {
-            memset(buffer, 0, BUFFER_SIZE);
-            int bytesReceived = recv(socketClienteAtivo, buffer, BUFFER_SIZE - 1, 0);
-
-            if (bytesReceived > 0) {
-                std::cout << "[THREAD ESCUTA] Recebido via rede: " << buffer;
-                std::string jsonVindoDaRede(buffer);
-                {
-                    std::lock_guard<std::mutex> lock(mutexFilaRecebidos);
-                    filaMensagensRecebidas.push(jsonVindoDaRede);
-                }
-                condFilaRecebidos.notify_one(); 
-            } 
-            else {
-                if (bytesReceived == 0) std::cout << "[THREAD ESCUTA] Cliente desconectou normalmente.\n";
-                else std::cout << "[THREAD ESCUTA] Conexao perdida ou erro.\n";
-                break; 
-            }
-        }
-
-        // Limpa o socket global ao desconectar
-        {
-            std::lock_guard<std::mutex> lock(mutexSocket);
-            closesocket(socketClienteAtivo);
-            socketClienteAtivo = INVALID_SOCKET;
-        }
+        // Cada cliente é atendido por sua própria thread de recv(),
+        // com seu próprio buffer acumulador (evita mistura de fragmentos
+        // de pacotes entre diferentes placas).
+        std::thread(threadClienteHandler, novoSocket, ipStr).detach();
     }
 
     closesocket(serverSocket);
     WSACleanup();
+}
+
+// =================================================================
+// 1.1 THREAD DEDICADA POR CLIENTE: FAZ O RECV() E MONTA O FIFO
+//     DE LEITURA USANDO UMA STRING ACUMULADORA, EXTRAINDO LINHAS
+//     COMPLETAS (DELIMITADAS POR '\n') ANTES DE ENFILEIRAR.
+// =================================================================
+void threadClienteHandler(SOCKET clientSocket, std::string clientIp) {
+    char buffer[BUFFER_SIZE];
+    std::string acumulador; // Buffer seguro contra fragmentação de pacotes TCP
+
+    while (sistemaRodando) {
+        memset(buffer, 0, BUFFER_SIZE);
+        int bytesReceived = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
+
+        if (bytesReceived > 0) {
+            acumulador.append(buffer, bytesReceived);
+
+            // Extrai todas as linhas completas já disponíveis no acumulador.
+            // Só faz push() para a fila quando encontra um '\n', garantindo
+            // que mensagens fragmentadas pelo TCP sejam remontadas corretamente.
+            size_t posQuebra;
+            while ((posQuebra = acumulador.find('\n')) != std::string::npos) {
+                std::string linhaCompleta = acumulador.substr(0, posQuebra);
+                acumulador.erase(0, posQuebra + 1);
+
+                if (!linhaCompleta.empty()) {
+                    std::cout << "[THREAD ESCUTA] Recebido de " << clientIp
+                              << ": " << linhaCompleta << "\n";
+                    {
+                        std::lock_guard<std::mutex> lock(mutexFilaRecebidos);
+                        filaMensagensRecebidas.push(linhaCompleta);
+                    }
+                    condFilaRecebidos.notify_one();
+                }
+            }
+        }
+        else {
+            if (bytesReceived == 0)
+                std::cout << "[THREAD ESCUTA] Cliente " << clientIp << " desconectou normalmente.\n";
+            else
+                std::cout << "[THREAD ESCUTA] Conexao perdida ou erro com " << clientIp << ".\n";
+            break;
+        }
+    }
+
+    removerCliente(clientSocket);
 }
 
 // =================================================================
@@ -133,7 +178,7 @@ void threadProcessa() {
         {
             std::unique_lock<std::mutex> lock(mutexFilaRecebidos);
             condFilaRecebidos.wait(lock, [] { return !filaMensagensRecebidas.empty() || !sistemaRodando; });
-            
+
             if (!sistemaRodando && filaMensagensRecebidas.empty()) break;
 
             jsonParaProcessar = filaMensagensRecebidas.front();
@@ -157,11 +202,15 @@ void lerMensagem(std::string jsonRecebido) {
     int amarelo  = inputDoc["status"]["amarelo"];
     int verde    = inputDoc["status"]["verde"];
 
+    // Lógica mantida exatamente como no original.
     if ((vermelho + amarelo + verde) == 0) {
-        ordem(1, 0); 
+        ordem(1, 0); // Apagão -> CRÍTICO
     }
     else if ((vermelho + amarelo + verde) > 1) {
-        ordem(0, 1); 
+        // Conflito lógico -> RESET imediato e incondicional, sem espera
+        // ou retenção de estado entre placas: a ordem vai direto para a
+        // fila de envio e será propagada via broadcast para todas as ESP32.
+        ordem(0, 1);
     }
 }
 
@@ -177,7 +226,7 @@ void ordem(int critico, int reset) {
 
     std::string output;
     serializeJson(docResposta, output);
-    output += "\n"; // Adiciona quebra de linha para o receptor saber que o JSON acabou
+    output += "\n"; // Delimitador de fim de mensagem para o receptor
 
     std::cout << "\n--- [ATUALIZACAO] Mensagem de decisao gerada ---" << std::endl;
     std::cout << "JSON Gerado: " << output;
@@ -186,11 +235,11 @@ void ordem(int critico, int reset) {
         std::lock_guard<std::mutex> lock(mutexFilaEnvio);
         filaMensagensParaEnviar.push(output);
     }
-    condFilaEnvio.notify_one(); 
+    condFilaEnvio.notify_one();
 }
 
 // =================================================================
-// 3. THREAD: ENVIA MENSAGENS (AGORA ENVIANDO DE VERDADE VIA SOCKET)
+// 3. THREAD: ENVIA MENSAGENS (BROADCAST PARA TODAS AS ESP32 ATIVAS)
 // =================================================================
 void threadEnvia() {
     std::cout << "[THREAD ENVIA] Inicializada..." << std::endl;
@@ -208,29 +257,44 @@ void threadEnvia() {
             filaMensagensParaEnviar.pop();
         }
 
-        // --- ENVIO REAL AQUI ---
-        // Bloqueia o uso do socket para garantir estabilidade
-std::lock_guard<std::mutex> lock(mutexSocket);
-        
-        if (socketClienteAtivo != INVALID_SOCKET) {
-            int resultadoEnvio = send(socketClienteAtivo, jsonParaEnviar.c_str(), jsonParaEnviar.length(), 0);
-            
-            if (resultadoEnvio == SOCKET_ERROR) {
-                std::cerr << "[THREAD ENVIA][ERR] Erro ao enviar dados para a ESP32.\n";
-            } else {
-                std::cout << "[THREAD ENVIA] Enviado com sucesso via rede: " << jsonParaEnviar;
-                
-                // VERIFICAÇÃO: Se o JSON continha a ordem CRITICO, acorda o terminal
-                if (jsonParaEnviar.find("CRITICO") != std::string::npos) {
-                    {
-                        std::lock_guard<std::mutex> lockTeclado(mutexTeclado);
-                        aguardandoReset = true;
-                    }
-                    condTeclado.notify_one(); // Libera a thread do teclado
+        bool enviouParaAlgumCliente = false;
+        std::vector<SOCKET> socketsComFalha;
+
+        {
+            std::lock_guard<std::mutex> lock(mutexSocket);
+
+            if (clientesAtivos.empty()) {
+                std::cout << "[THREAD ENVIA][AVISO] Mensagem ignorada: Nenhuma ESP32 conectada.\n";
+            }
+
+            // Broadcast: envia a mesma ordem para todas as placas conectadas
+            for (SOCKET s : clientesAtivos) {
+                int resultadoEnvio = send(s, jsonParaEnviar.c_str(), (int)jsonParaEnviar.length(), 0);
+
+                if (resultadoEnvio == SOCKET_ERROR) {
+                    std::cerr << "[THREAD ENVIA][ERR] Erro ao enviar dados para socket " << s << ".\n";
+                    socketsComFalha.push_back(s);
+                } else {
+                    std::cout << "[THREAD ENVIA] Enviado com sucesso para socket " << s
+                              << ": " << jsonParaEnviar;
+                    enviouParaAlgumCliente = true;
                 }
             }
-        } else {
-            std::cout << "[THREAD ENVIA][AVISO] Mensagem ignorada: Nenhuma ESP32 conectada.\n";
+        }
+
+        // Remove fora do lock de envio para evitar deadlock com removerCliente()
+        for (SOCKET s : socketsComFalha) {
+            removerCliente(s);
+        }
+
+        // Se a ordem CRITICO foi efetivamente enviada a pelo menos uma placa,
+        // acorda a thread do teclado aguardando confirmação de RESET.
+        if (enviouParaAlgumCliente && jsonParaEnviar.find("CRITICO") != std::string::npos) {
+            {
+                std::lock_guard<std::mutex> lockTeclado(mutexTeclado);
+                aguardandoReset = true;
+            }
+            condTeclado.notify_one();
         }
     }
 }
@@ -240,7 +304,7 @@ void threadMonitorTeclado() {
     const std::string CHAVE_ESPERADA = "RESET";
 
     while (sistemaRodando) {
-        // 1. Fica completamente adormecida até o send() do CRITICO acontecer
+        // 1. Fica completamente adormecida até o broadcast de CRITICO acontecer
         {
             std::unique_lock<std::mutex> lock(mutexTeclado);
             condTeclado.wait(lock, [] { return aguardandoReset || !sistemaRodando; });
@@ -255,10 +319,10 @@ void threadMonitorTeclado() {
         // 3. Valida a entrada
         if (entradaUsuario == CHAVE_ESPERADA) {
             std::cout << "[TECLADO] Comando aceito. Gerando ordem de RESET...\n";
-            
-            // Coloca a nova ordem na FIFO de envio
-            ordem(0, 1); 
-            
+
+            // Coloca a nova ordem na FIFO de envio (será propagada via broadcast)
+            ordem(0, 1);
+
             // Reseta a flag e volta a dormir no próximo ciclo do while
             {
                 std::lock_guard<std::mutex> lock(mutexTeclado);
