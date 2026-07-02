@@ -35,8 +35,8 @@
 #define DEST_NODE       0
 
 byte      mac[]    = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
-IPAddress ip       (192, 168, 10, 2);
-IPAddress serverIP (192, 168, 10, 1);   // ← IP do servidor/controladora
+IPAddress ip       (10, 10, 115, 211);
+IPAddress serverIP (10, 10, 115, 210);   // ← IP do servidor/controladora
 const uint16_t serverPort = 5000;
 
 // ==========================================
