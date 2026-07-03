@@ -105,6 +105,11 @@ void vTimerCallbackEnvio(TimerHandle_t xTimer) {
 void CRITICO() {
     estadoAtual = MODO_CRITICO;
     Serial.println("[ESTADO] Transicao para MODO_CRITICO efetuada.");
+
+    if (xTimerEnvio1s != NULL) {
+        xTimerStop(xTimerEnvio1s, 0);
+        Serial.println("[REDE] Timer de telemetria PARADO.");
+    }
     
     // Interrompe qualquer delay da taskRotina imediatamente
     if (TaskRotinaHandle != NULL) {
@@ -116,6 +121,11 @@ void RESET() {
     estadoAtual = MODO_ROTINA;
     rtc.setTime(1767225600);
     Serial.println("[ESTADO] RESET efetuado.");
+
+    if (xTimerEnvio1s != NULL) {
+        xTimerStart(xTimerEnvio1s, 0);
+        Serial.println("[REDE] Timer de telemetria REINICIADO.");
+    }
 }
 
 void ROTINA(int tempo_verde, int tempo_amarelo, int tempo_vermelho) {
