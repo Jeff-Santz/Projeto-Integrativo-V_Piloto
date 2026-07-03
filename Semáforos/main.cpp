@@ -70,6 +70,9 @@ bool sistemaRodando = true;
 
 
 
+int eps = 100; // Defasagem máxima tolerada em milissegundos (1 segundo)
+
+
 // --- VETOR DE SOCKETS PARA SUPORTAR MÚLTIPLAS ESP32 (BROADCAST) ---
 
 std::vector<SOCKET> clientesAtivos;
@@ -408,22 +411,21 @@ void lerMensagem(std::string jsonRecebido) {
 
     // Lógica mantida exatamente como no original.
 
-    if ((vermelho + amarelo + verde) == 0) {
+    if ((vermelho + amarelo + verde) != 1) {
 
         ordem(1, 0); // Apagão -> CRÍTICO
 
     }
 
-    else if ((vermelho + amarelo + verde) > 1) {
 
-        // Conflito lógico -> RESET imediato e incondicional, sem espera
+    uint64_t tempoAtualPC = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    uint64_t tempoSemaforo = inputDoc["timestamp"].as<uint64_t>();
 
-        // ou retenção de estado entre placas: a ordem vai direto para a
+    int64_t defasagemMs = (int64_t)tempoAtualPC - (int64_t)tempoSemaforo;
+    double defasagemSegundos = defasagemMs / 1000.0;
 
-        // fila de envio e será propagada via broadcast para todas as ESP32.
-
-        ordem(0, 1);
-
+    if(defasagemSegundos < (-eps) || defasagemSegundos > (eps)) {
+        ordem(0, 1); // Defasagem -> RESET
     }
 
 }
@@ -445,6 +447,9 @@ void ordem(int critico, int reset) {
     if (reset == 1) {
 
         docResposta["mensagem"] = "RESET";
+        docResposta["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+
+            std::chrono::system_clock::now().time_since_epoch()).count();
 
     }
 
