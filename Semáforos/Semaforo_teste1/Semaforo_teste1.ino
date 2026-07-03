@@ -83,7 +83,7 @@ void   atualizarFarol(int verde, int amarelo, int vermelho);
 void   lerControladora(String jsonRecebido);
 void   ROTINA(int tempo_verde, int tempo_amarelo, int tempo_vermelho);
 void   CRITICO();
-void   RESET();
+void   RESET(uint64_t timestamp_novo);
 void   sendPck(uint8_t sourceNode, uint8_t destinationNode, uint8_t state);
 
 void taskRotina    (void* pvParameters);
@@ -117,9 +117,9 @@ void CRITICO() {
     }
 }
 
-void RESET() {
+void RESET(uint64_t timestamp_novo) {
     estadoAtual = MODO_ROTINA;
-    rtc.setTime(1767225600);
+    rtc.setTime(timestamp_novo);
     Serial.println("[ESTADO] RESET efetuado.");
 
     if (xTimerEnvio1s != NULL) {
@@ -146,13 +146,14 @@ void lerControladora(String jsonRecebido) {
     // Comando de Ação
     if (inputDoc.containsKey("mensagem")) {
         String msg = inputDoc["mensagem"];
-        if (msg == "RESET") RESET();
+        if (msg == "RESET") RESET(inputDoc["timestamp"]);
         else if (msg == "CRITICO") CRITICO();
     }
     
     // Atualização de Tempo
     if (inputDoc.containsKey("timestamp")) {
-        long long novoTempo = inputDoc["timestamp"];
+        uint64_t timestamp_controladora = inputDoc["timestamp"];
+        uint64_t novoTempo = (uint64_t)(timestamp_controladora/1000);
         rtc.setTime(novoTempo);
         Serial.print("[SYNC] Relógio atualizado para: ");
         Serial.println(novoTempo);
@@ -299,7 +300,7 @@ void taskEscutaRede(void* pvParameters) {
             }
 
             if (estadoAtual == MODO_CRITICO) {
-                RESET(); // Chama o RESET() para mudar o estadoAtual e ajustar o RTC
+                RESET(rtc.getEpoch()); // Chama o RESET() para mudar o estadoAtual e ajustar o RTC
             }
 
             Serial.println("[REDE] EscutaRede: conexao ESTABELECIDA.");
@@ -332,7 +333,11 @@ void taskEscutaRede(void* pvParameters) {
 String montarJson(String id_semaforo) {
     JsonDocument doc;
     doc["id_semaforo"]        = id_semaforo;
-    doc["timestamp"]          = rtc.getEpoch();
+    
+    // Calcula o timestamp atual da ESP32 em MILISSEGUNDOS (uint64_t)
+    uint64_t tempoMiliESP = ((uint64_t)rtc.getEpoch() * 1000) + rtc.getMillis();
+    doc["timestamp"]          = tempoMiliESP;
+
     doc["status"]["vermelho"] = (analogRead(PIN_IN_VERMELHO) > CORTE_100MV) ? 1 : 0;
     doc["status"]["amarelo"]  = (analogRead(PIN_IN_AMARELO) > CORTE_100MV) ? 1 : 0;
     doc["status"]["verde"]    = (analogRead(PIN_IN_VERDE) > CORTE_100MV) ? 1 : 0;
