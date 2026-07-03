@@ -16,7 +16,7 @@
 #define PIN_OUT_VERMELHO 11
 #define PIN_IN_VERDE     6
 #define PIN_IN_AMARELO   3
-#define PIN_IN_VERMELHO  46
+#define PIN_IN_VERMELHO  4
 
 // ==========================================
 // PINOS: SPI / W5500
@@ -45,6 +45,9 @@ const uint16_t serverPort = 5000;
 enum EstadoSemaforo { MODO_ROTINA, MODO_CRITICO };
 volatile EstadoSemaforo estadoAtual = MODO_ROTINA;
 
+// Constante de corte: 100mV equivale a aproximadamente 124 no ADC de 12 bits
+const int CORTE_100MV = 124;
+
 TickType_t TEMPO_VERDE    = pdMS_TO_TICKS(10000);
 TickType_t TEMPO_AMARELO  = pdMS_TO_TICKS(4000);
 TickType_t TEMPO_VERMELHO = pdMS_TO_TICKS(16000);
@@ -58,6 +61,8 @@ String status_semaforo;
 TaskHandle_t TaskRotinaHandle  = NULL;
 TaskHandle_t TaskStatusHandle  = NULL;
 TaskHandle_t TaskRedeHandle    = NULL;
+
+TimerHandle_t xTimerEnvio1s    = NULL; // Timer do Status
 
 SemaphoreHandle_t xSinalFase;    // Binário — sinaliza mudança de fase
 SemaphoreHandle_t xMutexRotina;  // Mutex — protege TEMPO_*
@@ -84,6 +89,14 @@ void   sendPck(uint8_t sourceNode, uint8_t destinationNode, uint8_t state);
 void taskRotina    (void* pvParameters);
 void taskStatus    (void* pvParameters);
 void taskEscutaRede(void* pvParameters);
+
+// Callback do Timer: executado a cada 1s
+
+void vTimerCallbackEnvio(TimerHandle_t xTimer) {
+    // Libera o semáforo para forçar a taskStatus a enviar o JSON
+    xSemaphoreGive(xSinalFase);
+}
+
 
 // ==========================================
 // FUNÇÕES DE CONTROLE DE ESTADO
@@ -184,7 +197,6 @@ void taskRotina(void* pvParameters) {
         // --- FASE: VERMELHO ---
         if (xSemaphoreTake(xMutexRotina, portMAX_DELAY) == pdTRUE) {
             atualizarFarol(0, 0, 1);
-            xSemaphoreGive(xSinalFase);
             xSemaphoreGive(xMutexRotina);
         }
         if (ulTaskNotifyTake(pdTRUE, TEMPO_VERMELHO) > 0) continue;
@@ -194,7 +206,6 @@ void taskRotina(void* pvParameters) {
             xSemaphoreTake(xMutexRotina, portMAX_DELAY) == pdTRUE)
         {
             atualizarFarol(1, 0, 0);
-            xSemaphoreGive(xSinalFase);
             xSemaphoreGive(xMutexRotina);
             if (ulTaskNotifyTake(pdTRUE, TEMPO_VERDE) > 0) continue;
         }
@@ -204,7 +215,6 @@ void taskRotina(void* pvParameters) {
             xSemaphoreTake(xMutexRotina, portMAX_DELAY) == pdTRUE)
         {
             atualizarFarol(0, 1, 0);
-            xSemaphoreGive(xSinalFase);
             xSemaphoreGive(xMutexRotina);
             if (ulTaskNotifyTake(pdTRUE, TEMPO_AMARELO) > 0) continue;
         }
@@ -243,14 +253,33 @@ void taskEscutaRede(void* pvParameters) {
     char buffer[512];
 
     for (;;) {
+
+        // MUDANÇA CRÍTICA: Verifica primeiro o hardware do W5500 (Cabo desconectado)
+        if (Ethernet.linkStatus() == LinkOFF) {
+            Serial.println("[FAILSAFE] LINK FÍSICO CAIU! Cabo ethernet solto ou Switch desligado.");
+            
+            // Força o fechamento do socket fantasma no software
+            tcpClient.stop(); 
+            
+            // Se o cabo caiu com o sistema rodando, entra em crítico imediatamente
+            if (estadoAtual != MODO_CRITICO) {
+                Serial.println("[FAILSAFE] Forcando MODO_CRITICO por queda de Link Fisico!");
+                CRITICO();
+            }
+            
+            // Aguarda 2 segundos antes de checar o cabo de novo e evita tentar conectar sem cabo
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue; 
+        }
+
+
         // 1. Gerenciamento da Conexão
         if (!tcpClient.connected()) {
+
+
             Serial.println("[REDE] EscutaRede: reconectando ao servidor Master...");
-            // --- GATILHO FAILSAFE ---
-            // if (estadoAtual != MODO_CRITICO) {
-            //     Serial.println("[FAILSAFE] TCP Desconectado. Forcando MODO_CRITICO imediato.");
-            //     CRITICO();
-            // }
+
+
             tcpClient.stop();
 
             if (!tcpClient.connect(serverIP, serverPort)) {
@@ -258,6 +287,11 @@ void taskEscutaRede(void* pvParameters) {
                 vTaskDelay(pdMS_TO_TICKS(3000));
                 continue;
             }
+
+            if (estadoAtual == MODO_CRITICO) {
+                RESET(); // Chama o RESET() para mudar o estadoAtual e ajustar o RTC
+            }
+
             Serial.println("[REDE] EscutaRede: conexao ESTABELECIDA.");
         }
 
@@ -288,10 +322,10 @@ void taskEscutaRede(void* pvParameters) {
 String montarJson(String id_semaforo) {
     JsonDocument doc;
     doc["id_semaforo"]        = id_semaforo;
-    doc["timestamp"]          = rtc.getTime("%d/%m/%Y %H:%M:%S");
-    doc["status"]["vermelho"] = digitalRead(PIN_IN_VERMELHO);
-    doc["status"]["amarelo"]  = digitalRead(PIN_IN_AMARELO);
-    doc["status"]["verde"]    = digitalRead(PIN_IN_VERDE);
+    doc["timestamp"]          = rtc.getEpoch();
+    doc["status"]["vermelho"] = (analogRead(PIN_IN_VERMELHO) > CORTE_100MV) ? 1 : 0;
+    doc["status"]["amarelo"]  = (analogRead(PIN_IN_AMARELO) > CORTE_100MV) ? 1 : 0;
+    doc["status"]["verde"]    = (analogRead(PIN_IN_VERDE) > CORTE_100MV) ? 1 : 0;
 
     String output;
     serializeJson(doc, output);
@@ -352,6 +386,14 @@ void setup() {
     // Controle e status no núcleo 1
     xTaskCreatePinnedToCore(taskRotina,     "Rotina",     4096, NULL, 1, &TaskRotinaHandle, 1);
     xTaskCreatePinnedToCore(taskStatus,     "Status",     8192, NULL, 1, &TaskStatusHandle, 1);
+
+    // Criação do Timer de 1 segundo (1000ms) repetitivo (pdTRUE)
+    xTimerEnvio1s = xTimerCreate("Timer1s", pdMS_TO_TICKS(1000), pdTRUE, (void*)0, vTimerCallbackEnvio);
+    
+    if (xTimerEnvio1s != NULL) {
+        xTimerStart(xTimerEnvio1s, 0); // Inicia o Timer
+        Serial.println("[SETUP] Timer de telemetria de 1s iniciado.");
+    }
 
     Serial.println("[SETUP] Threads iniciadas. Sistema operacional.");
 }
