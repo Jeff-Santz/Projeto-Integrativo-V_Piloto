@@ -1,0 +1,8 @@
+semaforo_idf/build/
+master_idf/build/
+**/build/
+**/managed_components/
+**/sdkconfig.old
+master_py/.venv/
+__pycache__/
+*.pyc

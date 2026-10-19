@@ -1,0 +1,2 @@
+python-can[gs-usb]
+libusb-package
