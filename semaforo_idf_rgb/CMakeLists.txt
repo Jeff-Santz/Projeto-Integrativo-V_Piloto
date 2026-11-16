@@ -32,3 +32,10 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 idf_build_set_property(COMPILE_OPTIONS "-Wno-error=cpp" APPEND)
 
 project(semaforo_idf_rgb)
+
+# espressif/led_strip 2.5.x usa heap_caps_calloc/MALLOC_CAP_* em
+# led_strip_spi_dev.c sem incluir esp_heap_caps.h; no ESP-IDF 6.x esse header
+# nao vem mais "de carona" e a compilacao quebra. Forca o include so nesse
+# componente (workaround; remover quando o led_strip corrigir).
+idf_component_get_property(_led_strip_lib espressif__led_strip COMPONENT_LIB)
+target_compile_options(${_led_strip_lib} PRIVATE -include esp_heap_caps.h)
