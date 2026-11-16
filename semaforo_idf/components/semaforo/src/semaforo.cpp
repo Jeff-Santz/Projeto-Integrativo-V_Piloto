@@ -44,6 +44,31 @@ uint32_t tempo_ms_da_fase(const TemposSemaforo& t, can_proto::Fase fase)
     }
 }
 
+// Dado "ha quanto tempo (ms) o ciclo oficial comecou" (pos_no_ciclo, ja
+// dentro de [0, duracao_total_do_ciclo_deste_no)), descobre em que fase
+// ESTE no deveria estar e ha quanto tempo nela -- andando pela mesma
+// ORDEM_CICLO, mas comecando em fase_inicial (cada no entra no ciclo por
+// um ponto diferente, so isso que os diferencia).
+void calcular_fase_canonica(can_proto::Fase fase_inicial, const TemposSemaforo& tempos,
+                             uint32_t pos_no_ciclo, can_proto::Fase& fase_out, uint32_t& tempo_out)
+{
+    int indice = indice_na_ordem(fase_inicial);
+    uint32_t acumulado = 0;
+    for (int i = 0; i < 3; i++) {
+        can_proto::Fase fase = ORDEM_CICLO[(indice + i) % 3];
+        uint32_t duracao = tempo_ms_da_fase(tempos, fase);
+        if (pos_no_ciclo < acumulado + duracao) {
+            fase_out = fase;
+            tempo_out = pos_no_ciclo - acumulado;
+            return;
+        }
+        acumulado += duracao;
+    }
+    // So cai aqui se duracao_total == 0 (config invalida). Fallback seguro.
+    fase_out = fase_inicial;
+    tempo_out = 0;
+}
+
 } // namespace
 
 Semaforo::Semaforo(uint8_t node_id, const PinosSemaforo& pinos,
@@ -56,7 +81,7 @@ Semaforo::Semaforo(uint8_t node_id, const PinosSemaforo& pinos,
     sinal_envio_status_ = xSemaphoreCreateBinary();
 }
 
-void Semaforo::iniciar()
+void Semaforo::configurarGpios()
 {
     gpio_config_t out_cfg = {};
     out_cfg.mode = GPIO_MODE_OUTPUT;
@@ -72,6 +97,18 @@ void Semaforo::iniciar()
     in_cfg.pin_bit_mask = (1ULL << pinos_.in_verde) | (1ULL << pinos_.in_amarelo) |
                           (1ULL << pinos_.in_vermelho);
     gpio_config(&in_cfg);
+}
+
+void Semaforo::apagarTudo()
+{
+    gpio_set_level(pinos_.out_verde,    0);
+    gpio_set_level(pinos_.out_amarelo,  0);
+    gpio_set_level(pinos_.out_vermelho, 0);
+}
+
+void Semaforo::iniciar()
+{
+    configurarGpios();
 
     aplicarFase(fase_atual_.load());
     inicio_fase_tick_ = xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -161,44 +198,65 @@ void Semaforo::restaurarOperacao()
     if (fase_atual_.load() != can_proto::Fase::FAIL_SAFE) return;
 
     ESP_LOGI(TAG, "node_id=%d restaurando rotina normal (fase inicial)", node_id_);
+    uint32_t local_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    // Ate chegar um SYNC de verdade, assume que "oficial = 0" e' agora
+    // (equivalente a um reset local). ajuste_ms_ = -local_ms faz
+    // relogioOficialMs() valer 0 neste instante.
+    ajuste_ms_.store(-(int32_t)local_ms);
     fase_atual_.store(fase_inicial_);
+    inicio_fase_tick_.store(local_ms);
     if (task_rotina_handle_) xTaskNotifyGive(task_rotina_handle_);
+}
+
+uint32_t Semaforo::relogioOficialMs() const
+{
+    int64_t local_ms = (int64_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    return (uint32_t)(local_ms + (int64_t)ajuste_ms_.load());
+}
+
+void Semaforo::aplicarSync(uint32_t epoch_ms)
+{
+    // Fail-safe e decidido so pela coerencia da fiacao -- um sync nao
+    // tira ninguem dele nem entra nele.
+    if (fase_atual_.load() == can_proto::Fase::FAIL_SAFE) return;
+
+    uint32_t local_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    int32_t ajuste_anterior = ajuste_ms_.load();
+    int32_t novo_ajuste = (int32_t)epoch_ms - (int32_t)local_ms;
+    ajuste_ms_.store(novo_ajuste);
+
+    // Log so informativo (pra acompanhar no monitor serial): nao muda
+    // nada de estado, so mostra pra onde o ajuste foi e o que isso
+    // significa em fase/tempo oficial agora.
+    TemposSemaforo copia;
+    if (xSemaphoreTake(mutex_tempos_, portMAX_DELAY) == pdTRUE) {
+        copia = tempos_;
+        xSemaphoreGive(mutex_tempos_);
+    } else {
+        copia = tempos_;
+    }
+    uint32_t duracao_total = copia.verde_ms + copia.amarelo_ms + copia.vermelho_ms;
+    can_proto::Fase fase_oficial = fase_inicial_;
+    uint32_t tempo_oficial = 0;
+    if (duracao_total > 0) {
+        calcular_fase_canonica(fase_inicial_, copia, epoch_ms % duracao_total, fase_oficial, tempo_oficial);
+    }
+
+    ESP_LOGI(TAG, "node_id=%d SYNC recebido: epoch_ms=%lu (oficial agora=%s %lums) | ajuste %ldms -> %ldms (mudou %ldms)",
+             node_id_, (unsigned long)epoch_ms, nome_fase(fase_oficial), (unsigned long)tempo_oficial,
+             (long)ajuste_anterior, (long)novo_ajuste, (long)(novo_ajuste - ajuste_anterior));
+
+    if (task_rotina_handle_) xTaskNotifyGive(task_rotina_handle_); // acorda a rotina pra reavaliar logo, sem esperar o CHECK_INTERVAL_MS
 }
 
 // ---------------------------------------------------------------------
 // Task: rotina (ciclo de fases + monitoramento de coerencia)
 // ---------------------------------------------------------------------
 
-bool Semaforo::esperarFase(can_proto::Fase fase, uint32_t total_ms)
-{
-    uint32_t decorrido = 0;
-    while (decorrido < total_ms) {
-        uint32_t pedaco = (total_ms - decorrido < CHECK_INTERVAL_MS) ? (total_ms - decorrido) : CHECK_INTERVAL_MS;
-
-        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(pedaco)) > 0) {
-            return true; // interrompida por entrarFailSafe()/restaurarOperacao()
-        }
-        decorrido += pedaco;
-
-        if (fase_atual_.load() == can_proto::Fase::FAIL_SAFE) return true;
-
-        uint8_t flags = 0;
-        if (!verificarCoerencia(fase, flags)) {
-            ESP_LOGE(TAG, "node_id=%d MISMATCH na fase %d (flags=0x%02X) - entrando em fail-safe",
-                     node_id_, (int)fase, flags);
-            entrarFailSafe(true);
-            return true;
-        }
-    }
-    return false;
-}
-
 void Semaforo::taskRotinaTrampolim(void* self) { static_cast<Semaforo*>(self)->taskRotina(); }
 
 void Semaforo::taskRotina()
 {
-    int indice = indice_na_ordem(fase_inicial_);
-
     for (;;) {
         // --- Fail-safe: pisca amarelo e tenta se auto-recuperar ---
         // A cada ciclo de piscada, confere se a fiacao voltou a bater com a
@@ -211,7 +269,7 @@ void Semaforo::taskRotina()
             while (fase_atual_.load() == can_proto::Fase::FAIL_SAFE) {
                 aplicarFase(can_proto::Fase::FAIL_SAFE);
                 if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(BLINK_FAILSAFE_MS)) > 0) break;
-                gpio_set_level(pinos_.out_amarelo, 0);
+                apagarTudo();
                 if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(BLINK_FAILSAFE_MS)) > 0) break;
 
                 uint8_t flags = 0;
@@ -230,30 +288,52 @@ void Semaforo::taskRotina()
                     leituras_boas_seguidas = 0;
                 }
             }
-            indice = indice_na_ordem(fase_inicial_);
             continue;
         }
 
-        can_proto::Fase fase = ORDEM_CICLO[indice];
-        fase_atual_.store(fase);
-        inicio_fase_tick_ = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        aplicarFase(fase);
-
-        uint32_t tempo_ms;
+        // --- Operacao normal: a fase e' so uma funcao do relogio oficial ---
+        // Nao tem "proxima fase" guardada em variavel nenhuma. A cada
+        // volta, pergunta pro relogio (local + ajuste_ms_, atualizado
+        // pelos SYNCs) onde o ciclo deveria estar AGORA, e so reage se
+        // isso mudou desde a ultima volta. Um SYNC que corrige o ajuste
+        // em +-50ms nunca causa um "salto" visivel -- o proprio relogio
+        // ja nasce corrigido, a fase so muda quando realmente e' hora.
+        TemposSemaforo copia;
         if (xSemaphoreTake(mutex_tempos_, portMAX_DELAY) == pdTRUE) {
-            tempo_ms = tempo_ms_da_fase(tempos_, fase);
+            copia = tempos_;
             xSemaphoreGive(mutex_tempos_);
         } else {
-            tempo_ms = tempo_ms_da_fase(tempos_, fase);
+            copia = tempos_;
+        }
+        uint32_t duracao_total = copia.verde_ms + copia.amarelo_ms + copia.vermelho_ms;
+
+        if (duracao_total > 0) {
+            can_proto::Fase fase;
+            uint32_t tempo_na_fase;
+            calcular_fase_canonica(fase_inicial_, copia, relogioOficialMs() % duracao_total, fase, tempo_na_fase);
+
+            if (fase != fase_atual_.load()) {
+                fase_atual_.store(fase);
+                inicio_fase_tick_.store(xTaskGetTickCount() * portTICK_PERIOD_MS - tempo_na_fase);
+                aplicarFase(fase);
+                ESP_LOGI(TAG, "[FASE] node_id=%d -> %s (tempo_na_fase=%lums, duracao=%lums)",
+                         node_id_, nome_fase(fase), (unsigned long)tempo_na_fase,
+                         (unsigned long)tempo_ms_da_fase(copia, fase));
+            }
+
+            uint8_t flags = 0;
+            if (!verificarCoerencia(fase, flags)) {
+                ESP_LOGE(TAG, "node_id=%d MISMATCH na fase %d (flags=0x%02X) - entrando em fail-safe",
+                         node_id_, (int)fase, flags);
+                entrarFailSafe(true);
+                continue;
+            }
         }
 
-        ESP_LOGI(TAG, "[FASE] node_id=%d -> %s (%lu ms)", node_id_, nome_fase(fase), (unsigned long)tempo_ms);
-
-        esperarFase(fase, tempo_ms); // se interrompida por fail-safe, o topo do loop trata
-
-        if (fase_atual_.load() != can_proto::Fase::FAIL_SAFE) {
-            indice = (indice + 1) % 3;
-        }
+        // Espera um pedacinho, mas acorda na hora se um SYNC ou fail-safe
+        // precisar de reacao imediata (aplicarSync/entrarFailSafe chamam
+        // xTaskNotifyGive).
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CHECK_INTERVAL_MS));
     }
 }
 
@@ -314,6 +394,11 @@ void Semaforo::taskEscuta()
                 entrarFailSafe(false);
             } else if (msg.identifier == can_proto::ID_RESET) {
                 restaurarOperacao();
+            } else if (msg.identifier == can_proto::ID_SYNC &&
+                       msg.data_length_code >= sizeof(can_proto::SyncMsg)) {
+                can_proto::SyncMsg sync;
+                memcpy(&sync, msg.data, sizeof sync);
+                aplicarSync(sync.epoch_ms);
             } else {
                 bool eh_status = msg.identifier >= can_proto::ID_STATUS_BASE &&
                                 msg.identifier <  can_proto::ID_STATUS_BASE + 16 &&

@@ -7,6 +7,7 @@ namespace can_proto {
 
 constexpr uint32_t ID_FAILSAFE    = 0x000; // broadcast, qualquer nó pode mandar
 constexpr uint32_t ID_RESET       = 0x001; // broadcast, reservado pra controladora
+constexpr uint32_t ID_SYNC        = 0x002; // broadcast periódico da master: relógio oficial do ciclo
 constexpr uint32_t ID_STATUS_BASE = 0x010; // + node_id -> 0x010..0x01F (nodes 0-15)
 
 enum class Fase : uint8_t {
@@ -26,6 +27,17 @@ struct StatusMsg {
 };
 #pragma pack(pop)
 static_assert(sizeof(StatusMsg) == 8, "StatusMsg precisa caber num frame CAN classico (8 bytes)");
+
+// Relogio oficial do ciclo, segundo a master. epoch_ms = ms desde o
+// ultimo RESET (reinicia em 0 a cada "reset" do operador). Cada no usa
+// isso + sua propria fase_inicial pra calcular em que fase/tempo ELE
+// deveria estar agora, e se corrige se desviar demais.
+#pragma pack(push, 1)
+struct SyncMsg {
+    uint32_t epoch_ms;
+};
+#pragma pack(pop)
+static_assert(sizeof(SyncMsg) == 4, "SyncMsg precisa ter 4 bytes");
 
 inline uint32_t status_id(uint8_t node_id) { return ID_STATUS_BASE + node_id; }
 

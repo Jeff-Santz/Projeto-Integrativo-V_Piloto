@@ -11,6 +11,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from config_cruzamento import em_conflito
 from protocolo import Fase, StatusMsg
 
 
@@ -36,6 +37,29 @@ class MonitorSemaforos:
             e.flags_mismatch = msg.flags_mismatch
             e.ultimo_status = time.monotonic()
             e.silencioso_reportado = False  # voltou a falar, limpa a flag
+
+    def verificar_conflito(self, max_idade_s: float = 2.0) -> list[tuple[int, int]]:
+        """Pega todos os nos com status fresco (recebido ha menos de
+        max_idade_s) que estao reportando VERDE agora, e confere par a
+        par se aquela combinacao esta marcada como perigosa em
+        config_cruzamento.CONFLITOS. Generaliza pra qualquer numero de
+        vias -- quem decide o que e perigoso e a config, nao este
+        metodo. Nenhum no sozinho consegue perceber isso (cada um so
+        sabe da propria fiacao); so quem ouve todo mundo consegue.
+        Retorna a lista de pares (node_id_a, node_id_b) em conflito."""
+        agora = time.monotonic()
+        with self._lock:
+            verdes = [
+                node_id for node_id, e in self._nos.items()
+                if e.fase == Fase.VERDE and (agora - e.ultimo_status) <= max_idade_s
+            ]
+
+        conflitos: list[tuple[int, int]] = []
+        for i in range(len(verdes)):
+            for j in range(i + 1, len(verdes)):
+                if em_conflito(verdes[i], verdes[j]):
+                    conflitos.append((verdes[i], verdes[j]))
+        return conflitos
 
     def verificar_silenciosos(self, timeout_s: float) -> list[int]:
         """Retorna node_ids sem status ha mais de timeout_s, ainda nao

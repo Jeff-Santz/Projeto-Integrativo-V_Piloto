@@ -18,8 +18,9 @@ fail-safe sempre ganha.
 
 | ID (hex)        | Nome            | Quem manda                     | Dados |
 |------------------|-----------------|----------------------------------|-------|
-| `0x000`          | `ID_FAILSAFE`   | Qualquer nó, ou a master (watchdog) | 1 byte: node_id de origem (0xFF = master) |
+| `0x000`          | `ID_FAILSAFE`   | Qualquer nó, ou a master (watchdog/conflito) | 1 byte: node_id de origem (0xFF = master) |
 | `0x001`          | `ID_RESET`      | A master (ou um nó, no auto-recovery) | 1 byte: node_id de origem |
+| `0x002`          | `ID_SYNC`       | A master, periodicamente (a cada ~2s) | 4 bytes: `SyncMsg` |
 | `0x010`–`0x01F`  | status do nó    | Cada nó, 1x/segundo              | 8 bytes: `StatusMsg` |
 
 `status_id(node_id) = 0x010 + node_id` (suporta node_id 0–15).
@@ -40,6 +41,30 @@ fail-safe sempre ganha.
 leitura do pino de entrada daquela cor não bate com o que a fase atual
 esperava.
 
+## `SyncMsg` (4 bytes, little-endian, sem padding)
+
+| Campo      | Tipo   | Offset | Tamanho |
+|------------|--------|--------|---------|
+| `epoch_ms` | uint32 | 0      | 4       |
+
+`epoch_ms`: quantos ms já passaram desde o último `ID_RESET` (ou desde
+que a master subiu, se ainda não houve reset), segundo o relógio da
+master. É o "tempo oficial" do ciclo.
+
+Cada nó não guarda "em que fase estou" como estado — ele mantém só um
+**ajuste** (ms, pode ser negativo) que soma ao próprio tick livre pra
+formar o relógio oficial dele: `relogio_oficial = tick_local + ajuste`. A
+cada `SyncMsg` recebido, o nó recalcula esse ajuste pra que
+`relogio_oficial` bata com o `epoch_ms` da master naquele instante — não
+"pula" fase nenhuma, só corrige o relógio que a rotina consulta. A
+rotina, por sua vez, a cada ~200ms, calcula (a partir do relógio oficial
++ da própria `fase_inicial`) em que fase e com quanto tempo decorrido ELA
+deveria estar agora, e só troca o LED quando essa resposta muda. Existe
+porque cada ESP roda seu próprio clock livre (sem isso, um pequeno desvio
+de instante de boot — ou deriva de cristal entre as placas — se acumula
+e, depois de rodar um tempo, as fases dos dois semáforos saem de
+sincronia).
+
 ## Comportamento esperado
 
 - Cada nó manda seu `StatusMsg` a cada ~1s, sempre.
@@ -52,7 +77,21 @@ esperava.
 - Auto-recovery: um nó em fail-safe confere sozinho se a fiação voltou a
   bater; depois de ~3 leituras boas seguidas, sai do fail-safe e
   broadcasta `ID_RESET`.
-- A master (`master_py`) ouve tudo isso passivamente e adiciona um
-  watchdog: se um nó parar de mandar status por >3s sem ter avisado
-  fail-safe (morte silenciosa — crash, queda de energia), a master
-  broadcasta `ID_FAILSAFE` em nome dele.
+- A master (`master_py`) ouve tudo isso passivamente e adiciona dois
+  cuidados que nenhum nó sozinho consegue ter, porque exigem ver a rede
+  inteira ao mesmo tempo:
+  - **Watchdog**: se um nó parar de mandar status por >3s sem ter
+    avisado fail-safe (morte silenciosa — crash, queda de energia), a
+    master broadcasta `ID_FAILSAFE` em nome dele.
+  - **Conflito de fase**: entre os nós com status recente (<2s) que
+    estiverem reportando `VERDE` agora, a master confere par a par se
+    aquela combinação está marcada como perigosa em
+    `master_py/config_cruzamento.py` (`CONFLITOS`, um conjunto de pares
+    `(node_id_a, node_id_b)` — é o único lugar que precisa mudar quando
+    o cruzamento tiver mais vias). Se achar um par perigoso com os dois
+    verdes ao mesmo tempo, a master broadcasta `ID_FAILSAFE`
+    imediatamente (com um cooldown de 3s pra não floodar o barramento
+    enquanto o conflito persistir).
+  - A master também broadcasta `ID_SYNC` a cada ~2s (e logo depois de um
+    `ID_RESET`, já com `epoch_ms=0`) pra manter os nós alinhados entre
+    si — ver seção `SyncMsg` acima.

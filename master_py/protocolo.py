@@ -11,6 +11,7 @@ from enum import IntEnum
 
 ID_FAILSAFE = 0x000
 ID_RESET = 0x001
+ID_SYNC = 0x002  # broadcast periodico da master: relogio oficial do ciclo
 ID_STATUS_BASE = 0x010  # + node_id -> 0x010..0x01F (nodes 0-15)
 
 
@@ -47,3 +48,24 @@ def status_id(node_id: int) -> int:
 
 def eh_status_id(arbitration_id: int) -> bool:
     return ID_STATUS_BASE <= arbitration_id < ID_STATUS_BASE + 16
+
+
+# epoch_ms(I, little-endian) = 4 bytes, igual ao SyncMsg com #pragma pack(1)
+# no firmware. ms desde o ultimo "reset" do operador; cada no calcula a
+# partir disso em que fase ele deveria estar e se corrige se desviar.
+_SYNC_FMT = "<I"
+SYNC_SIZE = struct.calcsize(_SYNC_FMT)
+assert SYNC_SIZE == 4, "SyncMsg precisa ter exatamente 4 bytes"
+
+
+@dataclass
+class SyncMsg:
+    epoch_ms: int
+
+    def encode(self) -> bytes:
+        return struct.pack(_SYNC_FMT, self.epoch_ms & 0xFFFFFFFF)
+
+    @classmethod
+    def decode(cls, data: bytes) -> "SyncMsg":
+        (epoch_ms,) = struct.unpack(_SYNC_FMT, data)
+        return cls(epoch_ms)
