@@ -16,3 +16,4 @@ semaforo_idf/
 
 Build: `idf.py set-target esp32s3 && idf.py build flash monitor`
 Para o 2º semáforo: mude `NODE_ID` e `FASE_INICIAL` em `main/main.cpp`.
+Variante de teste com o LED RGB embutido (sem fiação de leitura): ver `../semaforo_idf_rgb/`.
