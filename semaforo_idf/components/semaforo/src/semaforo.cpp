@@ -1,5 +1,7 @@
 #include "semaforo.hpp"
 
+#include <cstring>
+
 #include "can_bus.hpp"
 #include "esp_log.h"
 
@@ -32,6 +34,18 @@ int indice_na_ordem(can_proto::Fase fase)
         if (ORDEM_CICLO[i] == fase) return i;
     }
     return 0; // fallback: VERMELHO
+}
+
+uint32_t agora_ms()
+{
+    return xTaskGetTickCount() * portTICK_PERIOD_MS;
+}
+
+// Ha quantos ms passou de "t" (seguro contra t um pouco no futuro, que
+// acontece quando outra task grava o instante depois de "agora" ser lido).
+int32_t decorrido_ms(uint32_t agora, uint32_t t)
+{
+    return (int32_t)(agora - t);
 }
 
 uint32_t tempo_ms_da_fase(const TemposSemaforo& t, can_proto::Fase fase)
@@ -112,6 +126,7 @@ void Semaforo::iniciar()
 
     aplicarFase(fase_atual_.load());
     inicio_fase_tick_ = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    boot_ms_ = agora_ms();
 
     xTaskCreatePinnedToCore(taskRotinaTrampolim, "sem_rotina", 4096, this, 2, &task_rotina_handle_, 1);
     xTaskCreatePinnedToCore(taskStatusTrampolim, "sem_status", 4096, this, 1, nullptr, 1);
@@ -151,7 +166,7 @@ bool Semaforo::verificarCoerencia(can_proto::Fase fase, uint8_t& flags_mismatch)
     bool r_lido = gpio_get_level(pinos_.in_vermelho);
 
     bool v_esperado = (fase == can_proto::Fase::VERDE);
-    bool a_esperado = (fase == can_proto::Fase::AMARELO);
+    bool a_esperado = (fase == can_proto::Fase::AMARELO) || (fase == can_proto::Fase::FAIL_SAFE);
     bool r_esperado = (fase == can_proto::Fase::VERMELHO);
 
     flags_mismatch = 0;
@@ -178,14 +193,15 @@ void Semaforo::onMensagemCAN(const twai_message_t& /*msg*/)
     // controladora futura sobrescrevem isso.
 }
 
-void Semaforo::entrarFailSafe(bool propagar)
+void Semaforo::entrarFailSafe(MotivoFailSafe motivo)
 {
     can_proto::Fase anterior = fase_atual_.exchange(can_proto::Fase::FAIL_SAFE);
     if (anterior == can_proto::Fase::FAIL_SAFE) return; // evita floodar o barramento
 
-    ESP_LOGW(TAG, "node_id=%d ENTRANDO EM FAIL-SAFE (propagar=%d)", node_id_, propagar);
+    motivo_failsafe_.store(motivo);
+    ESP_LOGW(TAG, "node_id=%d ENTRANDO EM FAIL-SAFE (motivo=%d)", node_id_, (int)motivo);
 
-    if (propagar) {
+    if (motivo != MotivoFailSafe::REMOTO) {
         uint8_t dados[1] = { node_id_ };
         can_bus::enviar(can_proto::ID_FAILSAFE, dados, 1);
     }
@@ -198,14 +214,59 @@ void Semaforo::restaurarOperacao()
     if (fase_atual_.load() != can_proto::Fase::FAIL_SAFE) return;
 
     ESP_LOGI(TAG, "node_id=%d restaurando rotina normal (fase inicial)", node_id_);
-    uint32_t local_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint32_t local_ms = agora_ms();
     // Ate chegar um SYNC de verdade, assume que "oficial = 0" e' agora
     // (equivalente a um reset local). ajuste_ms_ = -local_ms faz
     // relogioOficialMs() valer 0 neste instante.
     ajuste_ms_.store(-(int32_t)local_ms);
-    fase_atual_.store(fase_inicial_);
+
+    // Da um tempo de graca aos vigias: senao o silencio que causou o
+    // fail-safe re-dispararia na hora, antes do primeiro SYNC/status novo.
+    ultimo_sync_ms_.store(local_ms);
+    uint16_t vistos = peers_vistos_.load();
+    for (int i = 0; i < 16; i++) {
+        if (vistos & (1u << i)) ultimo_status_ms_[i].store(local_ms);
+    }
+
+    motivo_failsafe_.store(MotivoFailSafe::NENHUM);
     inicio_fase_tick_.store(local_ms);
+    fase_atual_.store(fase_inicial_);
     if (task_rotina_handle_) xTaskNotifyGive(task_rotina_handle_);
+}
+
+uint16_t Semaforo::paresSilenciosos(uint32_t agora) const
+{
+    uint16_t vistos = peers_vistos_.load();
+    uint16_t mudos = 0;
+    for (int i = 0; i < 16; i++) {
+        if (i == node_id_) continue;
+        uint16_t bit = (uint16_t)(1u << i);
+        if (vistos & bit) {
+            if (decorrido_ms(agora, ultimo_status_ms_[i].load()) > (int32_t)PEER_TIMEOUT_MS) mudos |= bit;
+        } else if ((nos_esperados_ & bit) &&
+                   decorrido_ms(agora, boot_ms_) > (int32_t)BOOT_GRACE_MS) {
+            mudos |= bit; // esperado e nunca apareceu
+        }
+    }
+    return mudos;
+}
+
+bool Semaforo::condicaoDeSaida(bool fiacao_ok)
+{
+    uint32_t agora = agora_ms();
+    switch (motivo_failsafe_.load()) {
+        case MotivoFailSafe::REMOTO:
+            return false; // so o ID_RESET de quem causou tira daqui
+        case MotivoFailSafe::SYNC_PERDIDO:
+            return fiacao_ok &&
+                   decorrido_ms(agora, ultimo_sync_ms_.load()) < (int32_t)(SYNC_TIMEOUT_MS / 2);
+        case MotivoFailSafe::PAR_SILENCIOSO:
+            return fiacao_ok && paresSilenciosos(agora) == 0;
+        case MotivoFailSafe::LOCAL:
+        case MotivoFailSafe::NENHUM:
+        default:
+            return fiacao_ok;
+    }
 }
 
 uint32_t Semaforo::relogioOficialMs() const
@@ -216,11 +277,16 @@ uint32_t Semaforo::relogioOficialMs() const
 
 void Semaforo::aplicarSync(uint32_t epoch_ms)
 {
-    // Fail-safe e decidido so pela coerencia da fiacao -- um sync nao
-    // tira ninguem dele nem entra nele.
+    uint32_t local_ms = agora_ms();
+    // Sempre registra que a master esta viva (inclusive em fail-safe: e' o
+    // que deixa um no SYNC_PERDIDO sair quando os SYNCs voltam).
+    ultimo_sync_ms_.store(local_ms);
+    sync_visto_.store(true);
+
+    // Em fail-safe nao mexe no relogio nem acorda a rotina (acordar
+    // zeraria a contagem de leituras boas da recuperacao).
     if (fase_atual_.load() == can_proto::Fase::FAIL_SAFE) return;
 
-    uint32_t local_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     int32_t ajuste_anterior = ajuste_ms_.load();
     int32_t novo_ajuste = (int32_t)epoch_ms - (int32_t)local_ms;
     ajuste_ms_.store(novo_ajuste);
@@ -257,28 +323,43 @@ void Semaforo::taskRotinaTrampolim(void* self) { static_cast<Semaforo*>(self)->t
 
 void Semaforo::taskRotina()
 {
+    int mismatches_seguidos = 0;
+
     for (;;) {
-        // --- Fail-safe: pisca amarelo e tenta se auto-recuperar ---
-        // A cada ciclo de piscada, confere se a fiacao voltou a bater com a
-        // fase_inicial_. Depois de RECOVERY_CONFIRMACOES leituras boas
-        // seguidas (nao uma unica, pra nao sair por um pulso de ruido), sai
-        // do fail-safe sozinho e avisa o barramento com ID_RESET -- assim
-        // nao depende de reset manual nem de uma controladora existir ainda.
+        // --- Fail-safe: pisca amarelo; sai conforme o MOTIVO ---
+        // A leitura da fiacao e' feita com o amarelo ACESO (o padrao
+        // esperado em fail-safe e "so amarelo"). Cada leitura boa conta;
+        // RECOVERY_CONFIRMACOES seguidas + a condicao do motivo = sai.
+        // Quem nao e' REMOTO re-anuncia o fail-safe a cada piscada, pra
+        // quem perdeu o frame original (ou ligou depois) entrar tambem.
         if (fase_atual_.load() == can_proto::Fase::FAIL_SAFE) {
+            mismatches_seguidos = 0;
             int leituras_boas_seguidas = 0;
             while (fase_atual_.load() == can_proto::Fase::FAIL_SAFE) {
                 aplicarFase(can_proto::Fase::FAIL_SAFE);
-                if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(BLINK_FAILSAFE_MS)) > 0) break;
-                apagarTudo();
-                if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(BLINK_FAILSAFE_MS)) > 0) break;
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(BLINK_FAILSAFE_MS));
+                if (fase_atual_.load() != can_proto::Fase::FAIL_SAFE) break;
 
                 uint8_t flags = 0;
-                if (verificarCoerencia(fase_inicial_, flags)) {
+                bool fiacao_ok = verificarCoerencia(can_proto::Fase::FAIL_SAFE, flags);
+
+                apagarTudo();
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(BLINK_FAILSAFE_MS));
+                if (fase_atual_.load() != can_proto::Fase::FAIL_SAFE) break;
+
+                MotivoFailSafe motivo = motivo_failsafe_.load();
+                if (motivo != MotivoFailSafe::REMOTO) {
+                    uint8_t dados[1] = { node_id_ };
+                    can_bus::enviar(can_proto::ID_FAILSAFE, dados, 1);
+                }
+
+                if (condicaoDeSaida(fiacao_ok)) {
                     leituras_boas_seguidas++;
-                    ESP_LOGI(TAG, "node_id=%d fiacao OK em fail-safe (%d/%d pra auto-recuperar)",
-                             node_id_, leituras_boas_seguidas, RECOVERY_CONFIRMACOES);
+                    ESP_LOGI(TAG, "node_id=%d condicao de saida OK (motivo=%d, %d/%d)",
+                             node_id_, (int)motivo, leituras_boas_seguidas, RECOVERY_CONFIRMACOES);
                     if (leituras_boas_seguidas >= RECOVERY_CONFIRMACOES) {
-                        ESP_LOGI(TAG, "node_id=%d AUTO-RECUPERANDO (fiacao estavel)", node_id_);
+                        ESP_LOGI(TAG, "node_id=%d AUTO-RECUPERANDO (motivo=%d)", node_id_, (int)motivo);
+                        // Avisa os que obedeceram (REMOTO) que podem voltar.
                         uint8_t dados[1] = { node_id_ };
                         can_bus::enviar(can_proto::ID_RESET, dados, 1);
                         restaurarOperacao();
@@ -291,13 +372,27 @@ void Semaforo::taskRotina()
             continue;
         }
 
+        // --- Vigias: master e pares ---
+        uint32_t agora = agora_ms();
+        if (sync_visto_.load() &&
+            decorrido_ms(agora, ultimo_sync_ms_.load()) > (int32_t)SYNC_TIMEOUT_MS) {
+            ESP_LOGE(TAG, "node_id=%d sem SYNC ha mais de %lums - fail-safe", node_id_,
+                     (unsigned long)SYNC_TIMEOUT_MS);
+            entrarFailSafe(MotivoFailSafe::SYNC_PERDIDO);
+            continue;
+        }
+        uint16_t mudos = paresSilenciosos(agora);
+        if (mudos != 0) {
+            ESP_LOGE(TAG, "node_id=%d par(es) silencioso(s) mascara=0x%04X - fail-safe", node_id_, mudos);
+            entrarFailSafe(MotivoFailSafe::PAR_SILENCIOSO);
+            continue;
+        }
+
         // --- Operacao normal: a fase e' so uma funcao do relogio oficial ---
         // Nao tem "proxima fase" guardada em variavel nenhuma. A cada
         // volta, pergunta pro relogio (local + ajuste_ms_, atualizado
         // pelos SYNCs) onde o ciclo deveria estar AGORA, e so reage se
-        // isso mudou desde a ultima volta. Um SYNC que corrige o ajuste
-        // em +-50ms nunca causa um "salto" visivel -- o proprio relogio
-        // ja nasce corrigido, a fase so muda quando realmente e' hora.
+        // isso mudou desde a ultima volta.
         TemposSemaforo copia;
         if (xSemaphoreTake(mutex_tempos_, portMAX_DELAY) == pdTRUE) {
             copia = tempos_;
@@ -312,9 +407,13 @@ void Semaforo::taskRotina()
             uint32_t tempo_na_fase;
             calcular_fase_canonica(fase_inicial_, copia, relogioOficialMs() % duracao_total, fase, tempo_na_fase);
 
-            if (fase != fase_atual_.load()) {
-                fase_atual_.store(fase);
-                inicio_fase_tick_.store(xTaskGetTickCount() * portTICK_PERIOD_MS - tempo_na_fase);
+            can_proto::Fase atual = fase_atual_.load();
+            if (atual == can_proto::Fase::FAIL_SAFE) continue; // outra task acabou de derrubar
+            if (fase != atual) {
+                // compare_exchange: se o fail-safe entrou entre o load e aqui,
+                // NAO sobrescreve com a fase do ciclo.
+                if (!fase_atual_.compare_exchange_strong(atual, fase)) continue;
+                inicio_fase_tick_.store(agora_ms() - tempo_na_fase);
                 aplicarFase(fase);
                 ESP_LOGI(TAG, "[FASE] node_id=%d -> %s (tempo_na_fase=%lums, duracao=%lums)",
                          node_id_, nome_fase(fase), (unsigned long)tempo_na_fase,
@@ -323,16 +422,21 @@ void Semaforo::taskRotina()
 
             uint8_t flags = 0;
             if (!verificarCoerencia(fase, flags)) {
-                ESP_LOGE(TAG, "node_id=%d MISMATCH na fase %d (flags=0x%02X) - entrando em fail-safe",
-                         node_id_, (int)fase, flags);
-                entrarFailSafe(true);
-                continue;
+                mismatches_seguidos++;
+                ESP_LOGW(TAG, "node_id=%d MISMATCH na fase %d (flags=0x%02X) %d/%d",
+                         node_id_, (int)fase, flags, mismatches_seguidos, MISMATCH_CONFIRMACOES);
+                if (mismatches_seguidos >= MISMATCH_CONFIRMACOES) {
+                    ESP_LOGE(TAG, "node_id=%d mismatch confirmado - entrando em fail-safe", node_id_);
+                    entrarFailSafe(MotivoFailSafe::LOCAL);
+                    continue;
+                }
+            } else {
+                mismatches_seguidos = 0;
             }
         }
 
         // Espera um pedacinho, mas acorda na hora se um SYNC ou fail-safe
-        // precisar de reacao imediata (aplicarSync/entrarFailSafe chamam
-        // xTaskNotifyGive).
+        // precisar de reacao imediata.
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CHECK_INTERVAL_MS));
     }
 }
@@ -391,9 +495,12 @@ void Semaforo::taskEscuta()
                 uint8_t origem = msg.data_length_code >= 1 ? msg.data[0] : 0xFF;
                 ESP_LOGW(TAG, "node_id=%d recebeu FAIL-SAFE do node_id=%d pelo barramento",
                          node_id_, origem);
-                entrarFailSafe(false);
+                entrarFailSafe(MotivoFailSafe::REMOTO);
             } else if (msg.identifier == can_proto::ID_RESET) {
-                restaurarOperacao();
+                // So solta quem obedeceu a um fail-safe alheio. Quem esta em
+                // fail-safe por motivo proprio (LOCAL/SYNC/PAR) sai pela sua
+                // propria condicao -- um RESET alheio nao pode mascarar o defeito.
+                if (motivo_failsafe_.load() == MotivoFailSafe::REMOTO) restaurarOperacao();
             } else if (msg.identifier == can_proto::ID_SYNC &&
                        msg.data_length_code >= sizeof(can_proto::SyncMsg)) {
                 can_proto::SyncMsg sync;
@@ -406,6 +513,11 @@ void Semaforo::taskEscuta()
                 if (eh_status) {
                     can_proto::StatusMsg st;
                     memcpy(&st, msg.data, sizeof st);
+                    if (msg.identifier != can_proto::status_id(node_id_)) {
+                        uint8_t id = (uint8_t)(msg.identifier - can_proto::ID_STATUS_BASE);
+                        ultimo_status_ms_[id].store(agora_ms());
+                        peers_vistos_.fetch_or((uint16_t)(1u << id));
+                    }
                     ESP_LOGI(TAG, "[RX] status de node_id=%d: fase=%s t_na_fase=%lu ms mismatch=0x%02X",
                             st.node_id, nome_fase((can_proto::Fase)st.fase),
                             (unsigned long)st.tempo_na_fase_ms, st.flags_mismatch);

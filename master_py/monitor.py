@@ -15,6 +15,9 @@ from config_cruzamento import em_conflito
 from protocolo import Fase, StatusMsg
 
 
+WATCHDOG_BOOT_GRACE_S = 10.0  # tempo pra um no esperado aparecer pela 1a vez
+
+
 @dataclass
 class EstadoNo:
     fase: Fase = Fase.FAIL_SAFE
@@ -72,6 +75,18 @@ class MonitorSemaforos:
                     e.silencioso_reportado = True
                     resultado.append(node_id)
         return resultado
+
+    def silenciosos_agora(self, timeout_s: float, esperados: set[int], desde_boot_s: float) -> set[int]:
+        """Estado (nao evento): todos os nos que estao mudos AGORA -- vistos
+        e parados ha mais de timeout_s, ou esperados e nunca vistos depois
+        de desde_boot_s. Sem a flag silencioso_reportado, entao da pra
+        re-broadcastar o fail-safe enquanto durar."""
+        agora = time.monotonic()
+        with self._lock:
+            mudos = {n for n, e in self._nos.items() if (agora - e.ultimo_status) > timeout_s}
+            if desde_boot_s > WATCHDOG_BOOT_GRACE_S:
+                mudos |= {n for n in esperados if n not in self._nos}
+        return mudos
 
     def snapshot_texto(self) -> str:
         agora = time.monotonic()

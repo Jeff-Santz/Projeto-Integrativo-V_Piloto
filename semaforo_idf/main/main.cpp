@@ -45,5 +45,8 @@ extern "C" void app_main(void)
 
     // static: o objeto precisa sobreviver ao fim do app_main, pois as tasks usam `this`.
     static Semaforo semaforo(NODE_ID, PINOS, TEMPOS, FASE_INICIAL);
+    // Nos que DEVEM existir na rede (bit = node_id). Um que nao apareca em
+    // ~10s derruba tudo pra fail-safe. Ajustar ao cruzamento (ex.: 3 vias = 0b111).
+    semaforo.definirNosEsperados((1u << 0) | (1u << 1));
     semaforo.iniciar();
 }

@@ -22,6 +22,7 @@ import threading
 import time
 
 from can_bus import CanBus
+from config_cruzamento import NOS_ESPERADOS
 from monitor import MonitorSemaforos
 from protocolo import ID_FAILSAFE, ID_RESET, ID_SYNC, Fase, StatusMsg, SyncMsg, eh_status_id
 
@@ -41,6 +42,7 @@ monitor = MonitorSemaforos()
 rodando = threading.Event()
 rodando.set()
 _ultimo_conflito_ts = 0.0
+_t_boot = time.monotonic()
 _epoch_inicio = time.monotonic()  # reiniciado a cada ID_RESET visto no barramento (de qualquer origem)
 
 
@@ -96,16 +98,24 @@ def _verificar_conflito(bus: CanBus) -> None:
 
 
 def thread_watchdog(bus: CanBus) -> None:
+    """Re-broadcasta FAIL-SAFE enquanto algum no estiver mudo (inclusive no
+    que nunca apareceu), e manda RESET quando todos voltarem a falar --
+    assim quem obedeceu o fail-safe sai dele. Os ESPs tambem vigiam uns aos
+    outros; isto e' o reforco + log da master."""
     log.info("[thread watchdog] iniciada")
+    tinha_mudos = False
     while rodando.is_set():
         time.sleep(WATCHDOG_INTERVALO_S)
-        for node_id in monitor.verificar_silenciosos(WATCHDOG_TIMEOUT_S):
-            log.error(
-                "node_id=%d ficou mais de %.0fs sem mandar status -- "
-                "broadcastando FAIL-SAFE em nome dele",
-                node_id, WATCHDOG_TIMEOUT_S,
-            )
-            bus.enviar(ID_FAILSAFE, bytes([node_id]))
+        mudos = monitor.silenciosos_agora(
+            WATCHDOG_TIMEOUT_S, NOS_ESPERADOS, time.monotonic() - _t_boot)
+        if mudos:
+            if not tinha_mudos:
+                log.error("nos mudos: %s -- FAIL-SAFE na rede", sorted(mudos))
+            bus.enviar(ID_FAILSAFE, bytes([min(mudos)]))
+        elif tinha_mudos:
+            log.info("todos os nos voltaram a falar -- RESET")
+            bus.enviar(ID_RESET, bytes([0xFF]))
+        tinha_mudos = bool(mudos)
     log.info("[thread watchdog] encerrada")
 
 
@@ -155,6 +165,8 @@ def main() -> None:
 
     bus = CanBus(bitrate=500_000)
     bus.iniciar_leitura(lambda msg: on_frame_recebido(bus, msg))
+    # Solta nos que ficaram em fail-safe por causa da master anterior.
+    bus.enviar(ID_RESET, bytes([0xFF]))
 
     wd = threading.Thread(target=thread_watchdog, args=(bus,), daemon=True)
     wd.start()
@@ -167,6 +179,9 @@ def main() -> None:
         pass
     finally:
         rodando.clear()
+        # Saida limpa: avisa os nos agora, sem esperar o timeout do SYNC.
+        # (Se a master morrer sem passar aqui, o watchdog de SYNC nos ESPs cobre.)
+        bus.enviar(ID_FAILSAFE, bytes([0xFF]))
         bus.fechar()
         log.info("Encerrado.")
 

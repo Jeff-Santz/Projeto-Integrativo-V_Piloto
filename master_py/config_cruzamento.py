@@ -34,6 +34,11 @@ CONFLITOS: set[tuple[int, int]] = {
 }
 
 
+# node_ids que DEVEM estar na rede. Um que nunca apareca (ou suma) vira
+# fail-safe. Manter igual ao definirNosEsperados() do firmware.
+NOS_ESPERADOS: set[int] = {0, 1}
+
+
 def em_conflito(node_a: int, node_b: int) -> bool:
     """True se esse par de node_ids esta marcado como perigoso em CONFLITOS."""
     par = (node_a, node_b) if node_a <= node_b else (node_b, node_a)

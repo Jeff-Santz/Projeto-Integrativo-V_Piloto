@@ -43,5 +43,7 @@ extern "C" void app_main(void)
 
     // static: o objeto precisa sobreviver ao fim do app_main, pois as tasks usam `this`.
     static SemaforoRGB semaforo(NODE_ID, RGB_GPIO, TEMPOS, FASE_INICIAL);
+    // Nos que DEVEM existir na rede (bit = node_id). Manter igual ao oficial.
+    semaforo.definirNosEsperados((1u << 0) | (1u << 1));
     semaforo.iniciar();
 }

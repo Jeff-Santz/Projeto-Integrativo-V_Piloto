@@ -45,7 +45,7 @@ class CanBus:
             self.bus.send(msg)
             logger.debug("TX id=0x%03X dados=%s", arbitration_id, data.hex(" "))
             return True
-        except can.CanError as exc:
+        except Exception as exc:
             logger.warning("Envio falhou (id=0x%03X): %s", arbitration_id, exc)
             return False
 
