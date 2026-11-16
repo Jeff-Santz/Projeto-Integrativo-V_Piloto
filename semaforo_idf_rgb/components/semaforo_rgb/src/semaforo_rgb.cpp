@@ -23,15 +23,16 @@ SemaforoRGB::SemaforoRGB(uint8_t node_id, gpio_num_t pino_rgb,
 
 void SemaforoRGB::configurarGpios()
 {
-    led_strip_config_t strip_config = {
-        .strip_gpio_num = pino_rgb_,
-        .max_leds = 1,
-        .led_pixel_format = LED_PIXEL_FORMAT_GRB,
-        .led_model = LED_MODEL_WS2812,
-    };
-    led_strip_rmt_config_t rmt_config = {
-        .resolution_hz = 10 * 1000 * 1000,
-    };
+    // Zera tudo e preenche campo a campo: com -Werror, o GCC novo recusa
+    // inicializador designado que deixa membros (flags, clk_src...) de fora.
+    led_strip_config_t strip_config = {};
+    strip_config.strip_gpio_num   = pino_rgb_;
+    strip_config.max_leds         = 1;
+    strip_config.led_pixel_format = LED_PIXEL_FORMAT_GRB;
+    strip_config.led_model        = LED_MODEL_WS2812;
+
+    led_strip_rmt_config_t rmt_config = {};
+    rmt_config.resolution_hz = 10 * 1000 * 1000;
 
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &strip_));
     led_strip_clear(strip_);
