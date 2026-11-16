@@ -497,10 +497,14 @@ void Semaforo::taskEscuta()
                          node_id_, origem);
                 entrarFailSafe(MotivoFailSafe::REMOTO);
             } else if (msg.identifier == can_proto::ID_RESET) {
-                // So solta quem obedeceu a um fail-safe alheio. Quem esta em
-                // fail-safe por motivo proprio (LOCAL/SYNC/PAR) sai pela sua
-                // propria condicao -- um RESET alheio nao pode mascarar o defeito.
-                if (motivo_failsafe_.load() == MotivoFailSafe::REMOTO) restaurarOperacao();
+                // RESET de outro no: so solta quem obedeceu um fail-safe alheio
+                // (REMOTO). Quem esta em fail-safe por motivo proprio sai pela
+                // propria condicao -- senao mascararia o defeito.
+                // RESET da master (origem 0xFF = comando do operador): forca a
+                // saida de qualquer motivo. Se o defeito persistir, o mismatch
+                // confirmado traz o no de volta ao fail-safe em ~0,4 s.
+                uint8_t origem = msg.data_length_code >= 1 ? msg.data[0] : 0xFF;
+                if (origem == 0xFF || motivo_failsafe_.load() == MotivoFailSafe::REMOTO) restaurarOperacao();
             } else if (msg.identifier == can_proto::ID_SYNC &&
                        msg.data_length_code >= sizeof(can_proto::SyncMsg)) {
                 can_proto::SyncMsg sync;
