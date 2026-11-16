@@ -324,6 +324,10 @@ void Semaforo::taskRotinaTrampolim(void* self) { static_cast<Semaforo*>(self)->t
 void Semaforo::taskRotina()
 {
     int mismatches_seguidos = 0;
+    // Depois de sair do fail-safe as saidas ainda estao no estado da
+    // piscada, mesmo com fase_atual_ == fase calculada: reaplica a fase uma
+    // vez antes de conferir a fiacao (senao da mismatch falso).
+    bool forcar_aplicar = false;
 
     for (;;) {
         // --- Fail-safe: pisca amarelo; sai conforme o MOTIVO ---
@@ -369,6 +373,7 @@ void Semaforo::taskRotina()
                     leituras_boas_seguidas = 0;
                 }
             }
+            forcar_aplicar = true;
             continue;
         }
 
@@ -418,6 +423,11 @@ void Semaforo::taskRotina()
                 ESP_LOGI(TAG, "[FASE] node_id=%d -> %s (tempo_na_fase=%lums, duracao=%lums)",
                          node_id_, nome_fase(fase), (unsigned long)tempo_na_fase,
                          (unsigned long)tempo_ms_da_fase(copia, fase));
+            }
+
+            if (forcar_aplicar) {
+                aplicarFase(fase);
+                forcar_aplicar = false;
             }
 
             uint8_t flags = 0;
